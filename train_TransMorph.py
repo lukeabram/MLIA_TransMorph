@@ -100,8 +100,8 @@ def main():
                                          ])
     train_set = NPYBrainDataset(train_dir, transforms=train_composed)
     val_set = NPYBrainDataset(val_dir, transforms=val_composed)
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_set, batch_size=50, shuffle=False, num_workers=2, pin_memory=True)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=36, pin_memory=True)
+    val_loader = DataLoader(val_set, batch_size=50, shuffle=False, num_workers=8, pin_memory=True)
 
     optimizer = optim.Adam(model.parameters(), lr=updated_lr, weight_decay=0, amsgrad=True)
     criterion = losses.SSIM_loss(False)
@@ -159,10 +159,10 @@ def main():
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            print('Iter {} of {} loss {:.4f}, Img Sim: {:.6f}, Reg: {:.6f}'.format(idx, len(train_loader), loss.item(), -loss_vals[0].item() / 2, loss_vals[1].item() / 2))
+            print('Iter {} of {} loss {:.4f}, Img Sim: {:.6f}, Reg: {:.6f}'.format(idx, len(train_loader), 1+loss.item(), -loss_vals[0].item() / 2, loss_vals[1].item() / 2))
 
         writer.add_scalar('Loss/train', loss_all.avg, epoch)
-        print('Epoch {} loss {:.4f}'.format(epoch, -loss_all.avg))
+        print('Epoch {} loss {:.4f}'.format(epoch, 1-loss_all.avg))
         '''
         Validation
         '''

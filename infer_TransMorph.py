@@ -1,6 +1,7 @@
 import glob
 import os, losses, utils
 from torch.utils.data import DataLoader
+from data.npy_dataset import NPYBrainDataset
 from data import datasets, trans
 import numpy as np
 import torch
@@ -10,9 +11,29 @@ from natsort import natsorted
 from models.TransMorph import CONFIGS as CONFIGS_TM
 import models.TransMorph as TransMorph
 from pytorch_msssim import ssim, ms_ssim, SSIM, MS_SSIM
+import torch.nn.functional as F
 
+class ResizeToFixed:
+    def __init__(self, size=(256, 256)):
+        self.size = size  # (H, W)
+
+    def __call__(self, imgs):
+        # imgs is [x, y], each shape: (C, H, W)
+        resized = []
+        for img in imgs:
+            img = np.ascontiguousarray(img)
+            img_tensor = torch.from_numpy(img).float().unsqueeze(0)  # (1, C, H, W) for interpolate
+            img_resized = F.interpolate(img_tensor, size=self.size, mode='bilinear', align_corners=False)
+            img_resized = img_resized.squeeze(0).numpy()  # back to (C, H, W)
+            resized.append(img_resized)
+        return resized
+        
 def main():
-    test_dir = 'E:/Junyu/DATA/RaFD/Test/'
+    test_composed = transforms.Compose([
+                                         ResizeToFixed((256, 256)),
+                                         trans.NumpyType((np.float32, np.float32))
+                                         ])
+    test_dir = '/scratch/vfv5up/MLIA/FinalProject/TransMorph_Transformer_for_Medical_Image_Registration/RaFD/TransMorph2D/brain_test_image_final.npy'
     model_idx = -1
     weights = [1, 1]
     model_folder = 'TransMorph_ssim_{}_diffusion_{}/'.format(weights[0], weights[1])
@@ -28,7 +49,7 @@ def main():
 
     config = CONFIGS_TM['TransMorph-Sin']
     model = TransMorph.TransMorph(config)
-    best_model = torch.load(model_dir + natsorted(os.listdir(model_dir))[model_idx])['state_dict']
+    best_model = torch.load(model_dir + natsorted(os.listdir(model_dir))[model_idx], weights_only=False)['state_dict']
     print('Best model: {}'.format(natsorted(os.listdir(model_dir))[model_idx]))
     model.load_state_dict(best_model)
     model.cuda()
@@ -36,9 +57,9 @@ def main():
     reg_model.cuda()
     reg_model_bilin = utils.register_model(config.img_size, 'bilinear')
     reg_model_bilin.cuda()
-    test_set = datasets.RaFDInferDataset(glob.glob(test_dir + '*.pkl'), transforms=None)
+    test_set = NPYBrainDataset(test_dir, transforms=test_composed)
     test_loader = DataLoader(test_set, batch_size=1, shuffle=False, num_workers=1, pin_memory=True, drop_last=True)
-    ssim = SSIM(data_range=255, size_average=True, channel=1)
+    ssim = SSIM(data_range=1, size_average=True, channel=1)
     eval_dsc_def = utils.AverageMeter()
     eval_dsc_raw = utils.AverageMeter()
     eval_det = utils.AverageMeter()
@@ -47,10 +68,8 @@ def main():
         for data in test_loader:
             model.eval()
             data = [t.cuda() for t in data]
-            x_rgb = data[0]
-            y_rgb = data[1]
-            x = data[2]
-            y = data[3]
+            x = data[0]
+            y = data[1]
 
             x_in = torch.cat((y, x), dim=1)
             output = model(x_in)
