@@ -162,7 +162,7 @@ def main():
             print('Iter {} of {} loss {:.4f}, Img Sim: {:.6f}, Reg: {:.6f}'.format(idx, len(train_loader), 1+loss.item(), -loss_vals[0].item() / 2, loss_vals[1].item() / 2))
 
         writer.add_scalar('Loss/train', loss_all.avg, epoch)
-        print('Epoch {} loss {:.4f}'.format(epoch, 1-loss_all.avg))
+        print('Epoch {} loss {:.4f}'.format(epoch, 1+loss_all.avg))
         '''
         Validation
         '''
