@@ -2,40 +2,39 @@ from torch.utils.tensorboard import SummaryWriter
 import os, utils, glob, losses
 import sys
 from torch.utils.data import DataLoader
+from data import datasets, trans
 from data.npy_dataset import NPYBrainDataset
-from data.npy_pair_dataset import NPYPairDataset
 import numpy as np
 import torch
 from torchvision import transforms
 from torch import optim
+import torch.nn as nn
+import matplotlib.pyplot as plt
 from natsort import natsorted
 from models.TransMorph import CONFIGS as CONFIGS_TM
 import models.TransMorph as TransMorph
-from pytorch_msssim import SSIM
+from pytorch_msssim import ssim, ms_ssim, SSIM, MS_SSIM
 import torch.nn.functional as F
 
 class ResizeToFixed:
-    def __init__(self, size):
-        self.size = size
+    def __init__(self, size=(256, 256)):
+        self.size = size  # (H, W)
 
     def __call__(self, imgs):
+        # imgs is [x, y], each shape: (C, H, W)
         resized = []
         for img in imgs:
             img = np.ascontiguousarray(img)
-            img_tensor = torch.from_numpy(img).float().unsqueeze(0)
-            img_resized = F.interpolate(
-                img_tensor,
-                size=self.size,
-                mode="bilinear",
-                align_corners=False
-            )
-            resized.append(img_resized.squeeze(0).numpy())
+            img_tensor = torch.from_numpy(img).float().unsqueeze(0)  # (1, C, H, W) for interpolate
+            img_resized = F.interpolate(img_tensor, size=self.size, mode='bilinear', align_corners=False)
+            img_resized = img_resized.squeeze(0).numpy()  # back to (C, H, W)
+            resized.append(img_resized)
         return resized
 
 class Logger(object):
     def __init__(self, save_dir):
         self.terminal = sys.stdout
-        self.log = open(save_dir + "logfile.log", "a")
+        self.log = open(save_dir+"logfile.log", "a")
 
     def write(self, message):
         self.terminal.write(message)
@@ -44,149 +43,222 @@ class Logger(object):
     def flush(self):
         pass
 
-def save_checkpoint(state, save_dir, filename, max_model_num=4):
-    os.makedirs(save_dir, exist_ok=True)
-    torch.save(state, os.path.join(save_dir, filename))
-    model_lists = natsorted(glob.glob(os.path.join(save_dir, "*")))
-    while len(model_lists) > max_model_num:
-        os.remove(model_lists[0])
-        model_lists = natsorted(glob.glob(os.path.join(save_dir, "*")))
-#
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Using device:", device)
-
-    MODE = "mnist"  # "brain" or "mnist"
-
-    weights = [1, 1]
-    lr = 1e-4
-    cont_training = False
-
-    if MODE == "brain":
-        batch_size = 32
-        max_epoch = 400
-        img_size = (256, 256)
-        train_dir = "/scratch/vfv5up/MLIA/FinalProject/TransMorph_Transformer_for_Medical_Image_Registration/RaFD/TransMorph2D/brain_train_image_final.npy"
-        val_dir = "/scratch/vfv5up/MLIA/FinalProject/TransMorph_Transformer_for_Medical_Image_Registration/RaFD/TransMorph2D/brain_test_image_final.npy"
-    else:
-        batch_size = 64
-        max_epoch = 30
-        img_size = (32, 32)
-        train_dir = "data/partB/mnist_train.npy"
-        val_dir = "data/partB/mnist_test.npy"
-
-    save_dir = f"TransMorph_{MODE}_ssim_{weights[0]}_diffusion_{weights[1]}/"
-    exp_dir = os.path.join("experiments", save_dir)
-    log_dir = os.path.join("logs", save_dir)
-
-    os.makedirs(exp_dir, exist_ok=True)
-    os.makedirs(log_dir, exist_ok=True)
-
-    sys.stdout = Logger(log_dir)
+    batch_size = 32
+    train_dir = '/scratch/vfv5up/MLIA/FinalProject/TransMorph_Transformer_for_Medical_Image_Registration/RaFD/TransMorph2D/brain_train_image_final.npy'
+    val_dir = '/scratch/vfv5up/MLIA/FinalProject/TransMorph_Transformer_for_Medical_Image_Registration/RaFD/TransMorph2D/brain_test_image_final.npy'
+    weights = [1, 1] # loss weights
+    save_dir = 'TransMorph_ssim_{}_diffusion_{}/'.format(weights[0], weights[1])
+    if not os.path.exists('experiments/'+save_dir):
+        os.makedirs('experiments/'+save_dir)
+    if not os.path.exists('logs/'+save_dir):
+        os.makedirs('logs/'+save_dir)
+    sys.stdout = Logger('logs/'+save_dir)
+    lr = 0.0001 # learning rate
     epoch_start = 0
+    max_epoch = 400 #max traning epoch
+    cont_training = False #if continue training
 
-    config = CONFIGS_TM["TransMorph"]
-    config.img_size = img_size
-    config.in_chans = 2
+    '''
+    Initialize model
+    '''
+    config = CONFIGS_TM['TransMorph']
+    model = TransMorph.TransMorph(config)
+    model.cuda()
 
-    model = TransMorph.TransMorph(config).to(device)
+    '''
+    Initialize spatial transformation function
+    '''
+    reg_model = utils.register_model(config.img_size, 'nearest')
+    reg_model.cuda()
+    reg_model_bilin = utils.register_model(config.img_size, 'bilinear')
+    reg_model_bilin.cuda()
 
+    '''
+    If continue from previous training
+    '''
     if cont_training:
-        ckpts = natsorted(os.listdir(exp_dir))
-        ckpt_path = os.path.join(exp_dir, ckpts[-1])
-        checkpoint = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(checkpoint["state_dict"])
-        print("Resumed from:", ckpt_path)
-
-    train_tf = transforms.Compose([ResizeToFixed(img_size)])
-    val_tf = transforms.Compose([ResizeToFixed(img_size)])
-
-    if MODE == "brain":
-        train_set = NPYBrainDataset(train_dir, transforms=train_tf)
-        val_set = NPYBrainDataset(val_dir, transforms=val_tf)
+        epoch_start = 201
+        model_dir = 'experiments/'+save_dir
+        updated_lr = round(lr * np.power(1 - (epoch_start) / max_epoch,0.9),8)
+        best_model = torch.load(model_dir + natsorted(os.listdir(model_dir))[-1])['state_dict']
+        print('Model: {} loaded!'.format(natsorted(os.listdir(model_dir))[-1]))
+        model.load_state_dict(best_model)
     else:
-        train_set = NPYPairDataset(train_dir, transforms=train_tf)
-        val_set = NPYPairDataset(val_dir, transforms=val_tf)
+        updated_lr = lr
 
-    train_loader = DataLoader(
-        train_set,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=(device.type == "cuda")
-    )
+    '''
+    Initialize training
+    '''
+    train_composed = transforms.Compose([trans.RandomFlip([2]),
+                                         ResizeToFixed((256, 256)),
+                                         trans.NumpyType((np.float32, np.float32))
+                                         ])
+    val_composed = transforms.Compose([
+                                         ResizeToFixed((256, 256)),
+                                         trans.NumpyType((np.float32, np.float32))
+                                         ])
+    train_set = NPYBrainDataset(train_dir, transforms=train_composed)
+    val_set = NPYBrainDataset(val_dir, transforms=val_composed)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=36, pin_memory=True)
+    val_loader = DataLoader(val_set, batch_size=50, shuffle=False, num_workers=8, pin_memory=True)
 
-    val_loader = DataLoader(
-        val_set,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=(device.type == "cuda")
-    )
-
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-
-    sim_loss = losses.SSIM_loss(False)
-    reg_loss = losses.Grad("l2")
-    criterions = [sim_loss, reg_loss]
-
-    ssim_metric = SSIM(data_range=1, size_average=True, channel=1).to(device)
-
-    writer = SummaryWriter(log_dir=log_dir)
-    best_score = -1e9
-
+    optimizer = optim.Adam(model.parameters(), lr=updated_lr, weight_decay=0, amsgrad=True)
+    criterion = losses.SSIM_loss(False)
+    ssim = SSIM(data_range=1, size_average=True, channel=1)
+    criterions = [criterion]
+    criterions += [losses.Grad('l2')]
+    best_ncc = 0
+    writer = SummaryWriter(log_dir='logs/'+save_dir)
     for epoch in range(epoch_start, max_epoch):
-        model.train()
-        loss_meter = utils.AverageMeter()
-
-        for x, y in train_loader:
-            x = x.to(device)
-            y = y.to(device)
-
-            x_in = torch.cat((x, y), dim=1)
+        print('Training Starts')
+        '''
+        Training
+        '''
+        loss_all = utils.AverageMeter()
+        idx = 0
+        for data in train_loader:
+            idx += 1
+            model.train()
+            adjust_learning_rate(optimizer, epoch, max_epoch, lr)
+            data = [t.cuda() for t in data]
+            x = data[0]
+            y = data[1]
+            x_in = torch.cat((x,y), dim=1)
             output = model(x_in)
-
-            loss = criterions[0](output[0], y) + criterions[1](output[1], y)
-
-            optimizer.zero_grad(set_to_none=True)
+            loss = 0
+            loss_vals = []
+            for n, loss_function in enumerate(criterions):
+                if n == 0:
+                    curr_loss = loss_function(output[n], y) * weights[n]
+                else:
+                    curr_loss = loss_function(output[n], y) * weights[n]
+                loss_vals.append(curr_loss)
+                loss += curr_loss
+            loss_all.update(loss.item(), y.numel())
+            # compute gradient and do SGD step
+            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            loss_meter.update(loss.item(), y.numel())
+            del x_in
+            del output
+            # flip fixed and moving images
+            loss = 0
+            x_in = torch.cat((y, x), dim=1)
+            output = model(x_in)
+            for n, loss_function in enumerate(criterions):
+                if n == 0:
+                    curr_loss = loss_function(output[n], x) * weights[n]
+                else:
+                    curr_loss = loss_function(output[n], x) * weights[n]
+                loss_vals[n] += curr_loss
+                loss += curr_loss
+            loss_all.update(loss.item(), y.numel())
+            # compute gradient and do SGD step
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            print('Iter {} of {} loss {:.4f}, Img Sim: {:.6f}, Reg: {:.6f}'.format(idx, len(train_loader), 1+loss.item(), -loss_vals[0].item() / 2, loss_vals[1].item() / 2))
 
-        writer.add_scalar("Loss/train", loss_meter.avg, epoch)
-        print(f"Epoch {epoch}: Train Loss {loss_meter.avg:.4f}")
-
-        model.eval()
-        eval_meter = utils.AverageMeter()
-
+        writer.add_scalar('Loss/train', loss_all.avg, epoch)
+        print('Epoch {} loss {:.4f}'.format(epoch, 1-loss_all.avg))
+        '''
+        Validation
+        '''
+        eval_ncc = utils.AverageMeter()
         with torch.no_grad():
-            for x, y in val_loader:
-                x = x.to(device)
-                y = y.to(device)
+            for data in val_loader:
+                model.eval()
+                data = [t.cuda() for t in data]
+                x = data[0]
+                y = data[1]
 
                 x_in = torch.cat((y, x), dim=1)
                 output = model(x_in)
-                score = ssim_metric(output[0], x)
-                eval_meter.update(score.item(), x.numel())
+                ncc = ssim(output[0], x)
+                eval_ncc.update(ncc.item(), x.numel())
 
-        writer.add_scalar("SSIM/val", eval_meter.avg, epoch)
-        print(f"Epoch {epoch}: Val SSIM {eval_meter.avg:.4f}")
+                #flip image
+                x_in = torch.cat((x, y), dim=1)
+                output = model(x_in)
+                ncc = ssim(output[0], y)
+                eval_ncc.update(ncc.item(), y.numel())
 
-        if eval_meter.avg > best_score:
-            best_score = eval_meter.avg
-            save_checkpoint(
-                {
-                    "epoch": epoch,
-                    "state_dict": model.state_dict(),
-                    "best_score": best_score,
-                    "optimizer": optimizer.state_dict(),
-                },
-                save_dir=exp_dir,
-                filename=f"best_{best_score:.4f}.pth.tar"
-            )
+                # warp images for visualization
+                def_out = reg_model_bilin([x, output[1].cuda()])  # predicted warped image
+                def_grid = reg_model_bilin([mk_grid_img(8,1,(x.shape[0], config.img_size[0], config.img_size[1])).float(), output[1].cuda()])
 
+                print(eval_ncc.avg)
+        best_ncc = max(eval_ncc.avg, best_ncc)
+        save_checkpoint({
+            'epoch': epoch + 1,
+            'state_dict': model.state_dict(),
+            'best_ncc': best_ncc,
+            'optimizer': optimizer.state_dict(),
+        }, save_dir='experiments/'+save_dir, filename='dsc{:.3f}.pth.tar'.format(eval_ncc.avg))
+        writer.add_scalar('DSC/validate', eval_ncc.avg, epoch)
+        plt.switch_backend('agg')
+        pred_fig = comput_fig(def_out)
+        grid_fig = comput_fig(def_grid)
+        x_fig = comput_fig(x)
+        tar_fig = comput_fig(y)
+        writer.add_figure('Grid', grid_fig, epoch)
+        plt.close(grid_fig)
+        writer.add_figure('input', x_fig, epoch)
+        plt.close(x)
+        writer.add_figure('ground truth', tar_fig, epoch)
+        plt.close(tar_fig)
+        writer.add_figure('prediction', pred_fig, epoch)
+        plt.close(pred_fig)
+        loss_all.reset()
     writer.close()
 
-if __name__ == "__main__":
+def comput_fig(img):
+    img = img.detach().cpu().numpy()[0:16, 0, :, :]
+    if img.shape[-1] == 3:
+        img = img.astype(np.uint8)[...,  ::-1]
+    fig = plt.figure(figsize=(12,12), dpi=180)
+    for i in range(img.shape[0]):
+        plt.subplot(4, 4, i + 1)
+        plt.axis('off')
+        plt.imshow(img[i, :, :], cmap='gray')
+    fig.subplots_adjust(wspace=0, hspace=0)
+    return fig
+
+def adjust_learning_rate(optimizer, epoch, MAX_EPOCHES, INIT_LR, power=0.9):
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = round(INIT_LR * np.power( 1 - (epoch) / MAX_EPOCHES ,power),8)
+
+def mk_grid_img(grid_step, line_thickness=1, grid_sz=(64, 256, 256)):
+    grid_img = np.zeros(grid_sz)
+    for j in range(0, grid_img.shape[1], grid_step):
+        grid_img[:, j+line_thickness-1, :] = 1
+    for i in range(0, grid_img.shape[2], grid_step):
+        grid_img[:, :, i+line_thickness-1] = 1
+    grid_img = grid_img[:, None, ...]
+    grid_img = torch.from_numpy(grid_img).cuda()
+    return grid_img
+
+def save_checkpoint(state, save_dir='models', filename='checkpoint.pth.tar', max_model_num=4):
+    torch.save(state, save_dir+filename)
+    model_lists = natsorted(glob.glob(save_dir + '*'))
+    while len(model_lists) > max_model_num:
+        os.remove(model_lists[0])
+        model_lists = natsorted(glob.glob(save_dir + '*'))
+
+if __name__ == '__main__':
+    '''
+    GPU configuration
+    '''
+    GPU_iden = 0
+    GPU_num = torch.cuda.device_count()
+    print('Number of GPU: ' + str(GPU_num))
+    for GPU_idx in range(GPU_num):
+        GPU_name = torch.cuda.get_device_name(GPU_idx)
+        print('     GPU #' + str(GPU_idx) + ': ' + GPU_name)
+    torch.cuda.set_device(GPU_iden)
+    GPU_avai = torch.cuda.is_available()
+    print('Currently using: ' + torch.cuda.get_device_name(GPU_iden))
+    print('If the GPU is available? ' + str(GPU_avai))
     main()
