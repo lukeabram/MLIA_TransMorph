@@ -1,122 +1,202 @@
+from torch.utils.tensorboard import SummaryWriter
+import os
+import utils
 import glob
-import os, losses, utils
+import losses
+import sys
+#
 from torch.utils.data import DataLoader
 from data.npy_dataset import NPYBrainDataset
-from data import datasets, trans
+from data.npy_pair_dataset import NPYPairDataset
+
 import numpy as np
 import torch
 from torchvision import transforms
-import matplotlib.pyplot as plt
+from torch import optim
 from natsort import natsorted
+
 from models.TransMorph import CONFIGS as CONFIGS_TM
 import models.TransMorph as TransMorph
-from pytorch_msssim import ssim, ms_ssim, SSIM, MS_SSIM
+from pytorch_msssim import SSIM
 import torch.nn.functional as F
 
+
 class ResizeToFixed:
-    def __init__(self, size=(256, 256)):
-        self.size = size  # (H, W)
+    def __init__(self, size):
+        self.size = size
 
     def __call__(self, imgs):
-        # imgs is [x, y], each shape: (C, H, W)
         resized = []
         for img in imgs:
             img = np.ascontiguousarray(img)
-            img_tensor = torch.from_numpy(img).float().unsqueeze(0)  # (1, C, H, W) for interpolate
-            img_resized = F.interpolate(img_tensor, size=self.size, mode='bilinear', align_corners=False)
-            img_resized = img_resized.squeeze(0).numpy()  # back to (C, H, W)
-            resized.append(img_resized)
+            img_tensor = torch.from_numpy(img).float().unsqueeze(0)
+            img_resized = F.interpolate(
+                img_tensor,
+                size=self.size,
+                mode="bilinear",
+                align_corners=False
+            )
+            resized.append(img_resized.squeeze(0).numpy())
         return resized
-        
+
+
+class Logger(object):
+    def __init__(self, save_dir):
+        self.terminal = sys.stdout
+        self.log = open(save_dir + "logfile.log", "a")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+
+    def flush(self):
+        pass
+
+
+def save_checkpoint(state, save_dir, filename, max_model_num=4):
+    os.makedirs(save_dir, exist_ok=True)
+    torch.save(state, os.path.join(save_dir, filename))
+    model_lists = natsorted(glob.glob(os.path.join(save_dir, "*")))
+    while len(model_lists) > max_model_num:
+        os.remove(model_lists[0])
+        model_lists = natsorted(glob.glob(os.path.join(save_dir, "*")))
+
+
 def main():
-    test_composed = transforms.Compose([
-                                         ResizeToFixed((256, 256)),
-                                         trans.NumpyType((np.float32, np.float32))
-                                         ])
-    test_dir = '/scratch/vfv5up/MLIA/FinalProject/TransMorph_Transformer_for_Medical_Image_Registration/RaFD/TransMorph2D/brain_test_image_final.npy'
-    model_idx = -1
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
+
+    MODE = "mnist"  # "brain" or "mnist"
     weights = [1, 1]
-    model_folder = 'TransMorph_ssim_{}_diffusion_{}/'.format(weights[0], weights[1])
-    model_dir = 'experiments/' + model_folder
+    lr = 1e-4
+    cont_training = False
 
-    if not os.path.exists('Quantitative_Results/'):
-        os.makedirs('Quantitative_Results/')
-    if os.path.exists('Quantitative_Results/'+model_folder[:-1]+'.csv'):
-        os.remove('Quantitative_Results/'+model_folder[:-1]+'.csv')
-    csv_writter(model_folder[:-1], 'Quantitative_Results/' + model_folder[:-1])
-    line = ',SSIM,det'
-    csv_writter(line, 'Quantitative_Results/' + model_folder[:-1])
+    if MODE == "brain":
+        batch_size = 32
+        max_epoch = 400
+        img_size = (256, 256)
+        train_dir = "/scratch/vfv5up/MLIA/FinalProject/TransMorph_Transformer_for_Medical_Image_Registration/RaFD/TransMorph2D/brain_train_image_final.npy"
+        val_dir = "/scratch/vfv5up/MLIA/FinalProject/TransMorph_Transformer_for_Medical_Image_Registration/RaFD/TransMorph2D/brain_test_image_final.npy"
+    else:
+        batch_size = 64
+        max_epoch = 30
+        img_size = (32, 32)
+        train_dir = "data/partB/mnist_train.npy"
+        val_dir = "data/partB/mnist_test.npy"
 
-    config = CONFIGS_TM['TransMorph-Sin']
-    model = TransMorph.TransMorph(config)
-    best_model = torch.load(model_dir + natsorted(os.listdir(model_dir))[model_idx], weights_only=False)['state_dict']
-    print('Best model: {}'.format(natsorted(os.listdir(model_dir))[model_idx]))
-    model.load_state_dict(best_model)
-    model.cuda()
-    reg_model = utils.register_model(config.img_size, 'nearest')
-    reg_model.cuda()
-    reg_model_bilin = utils.register_model(config.img_size, 'bilinear')
-    reg_model_bilin.cuda()
-    test_set = NPYBrainDataset(test_dir, transforms=test_composed)
-    test_loader = DataLoader(test_set, batch_size=1, shuffle=False, num_workers=1, pin_memory=True, drop_last=True)
-    ssim = SSIM(data_range=1, size_average=True, channel=1)
-    eval_dsc_def = utils.AverageMeter()
-    eval_dsc_raw = utils.AverageMeter()
-    eval_det = utils.AverageMeter()
-    with torch.no_grad():
-        stdy_idx = 0
-        for data in test_loader:
-            model.eval()
-            data = [t.cuda() for t in data]
-            x = data[0]
-            y = data[1]
+    save_dir = f"TransMorph_{MODE}_ssim_{weights[0]}_diffusion_{weights[1]}/"
+    exp_dir = os.path.join("experiments", save_dir)
+    log_dir = os.path.join("logs", save_dir)
 
-            x_in = torch.cat((y, x), dim=1)
-            output = model(x_in)
-            ncc = ssim(y, x)
-            eval_dsc_raw.update(ncc.item(), x.numel())
-            ncc = ssim(output[0], x)
-            eval_dsc_def.update(ncc.item(), x.numel())
-            jac_det = utils.jacobian_determinant_vxm(output[1].detach().cpu().numpy()[0, :, :, :])
-            eval_det.update(np.sum(jac_det <= 0) / np.prod(x.shape), x.numel())
-            line = 'p{}'.format(stdy_idx) + ',' + str(ncc.item()) + ',' + str(np.sum(jac_det <= 0) / np.prod(x.shape))
-            csv_writter(line, 'Quantitative_Results/' + model_folder[:-1])
-            stdy_idx += 1
-            # flip image
+    os.makedirs(exp_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+
+    sys.stdout = Logger(log_dir)
+    epoch_start = 0
+
+    config = CONFIGS_TM["TransMorph"]
+    config.img_size = img_size
+    config.in_chans = 2
+
+    model = TransMorph.TransMorph(config).to(device)
+
+    if cont_training:
+        ckpts = natsorted(os.listdir(exp_dir))
+        ckpt_path = os.path.join(exp_dir, ckpts[-1])
+        checkpoint = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(checkpoint["state_dict"])
+        print("Resumed from:", ckpt_path)
+
+    train_tf = transforms.Compose([ResizeToFixed(img_size)])
+    val_tf = transforms.Compose([ResizeToFixed(img_size)])
+
+    if MODE == "brain":
+        train_set = NPYBrainDataset(train_dir, transforms=train_tf)
+        val_set = NPYBrainDataset(val_dir, transforms=val_tf)
+    else:
+        train_set = NPYPairDataset(train_dir, transforms=train_tf)
+        val_set = NPYPairDataset(val_dir, transforms=val_tf)
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=(device.type == "cuda")
+    )
+
+    val_loader = DataLoader(
+        val_set,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=(device.type == "cuda")
+    )
+
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    sim_loss = losses.SSIM_loss(False)
+    reg_loss = losses.Grad("l2")
+    criterions = [sim_loss, reg_loss]
+
+    ssim_metric = SSIM(data_range=1, size_average=True, channel=1).to(device)
+
+    writer = SummaryWriter(log_dir=log_dir)
+    best_score = -1e9
+
+    for epoch in range(epoch_start, max_epoch):
+        model.train()
+        loss_meter = utils.AverageMeter()
+
+        for x, y in train_loader:
+            x = x.to(device)
+            y = y.to(device)
+
             x_in = torch.cat((x, y), dim=1)
             output = model(x_in)
-            ncc = ssim(y, x)
-            eval_dsc_raw.update(ncc.item(), x.numel())
-            ncc = ssim(output[0], y)
-            eval_dsc_def.update(ncc.item(), y.numel())
-            jac_det = utils.jacobian_determinant_vxm(output[1].detach().cpu().numpy()[0, :, :, :])
-            line = 'p{}'.format(stdy_idx) + ',' + str(ncc.item()) + ',' + str(np.sum(jac_det <= 0) / np.prod(x.shape))
-            eval_det.update(np.sum(jac_det <= 0) / np.prod(x.shape), x.numel())
-            csv_writter(line, 'Quantitative_Results/' + model_folder[:-1])
-            stdy_idx += 1
-        print('Deformed DSC: {:.3f} +- {:.3f}, Affine DSC: {:.3f} +- {:.3f}'.format(eval_dsc_def.avg,
-                                                                                    eval_dsc_def.std,
-                                                                                    eval_dsc_raw.avg,
-                                                                                    eval_dsc_raw.std))
-        print('deformed det: {}, std: {}'.format(eval_det.avg, eval_det.std))
 
-def csv_writter(line, name):
-    with open(name+'.csv', 'a') as file:
-        file.write(line)
-        file.write('\n')
+            loss = criterions[0](output[0], y) + criterions[1](output[1], y)
 
-if __name__ == '__main__':
-    '''
-    GPU configuration
-    '''
-    GPU_iden = 0
-    GPU_num = torch.cuda.device_count()
-    print('Number of GPU: ' + str(GPU_num))
-    for GPU_idx in range(GPU_num):
-        GPU_name = torch.cuda.get_device_name(GPU_idx)
-        print('     GPU #' + str(GPU_idx) + ': ' + GPU_name)
-    torch.cuda.set_device(GPU_iden)
-    GPU_avai = torch.cuda.is_available()
-    print('Currently using: ' + torch.cuda.get_device_name(GPU_iden))
-    print('If the GPU is available? ' + str(GPU_avai))
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+            loss_meter.update(loss.item(), y.numel())
+
+        writer.add_scalar("Loss/train", loss_meter.avg, epoch)
+        print(f"Epoch {epoch}: Train Loss {loss_meter.avg:.4f}")
+
+        model.eval()
+        eval_meter = utils.AverageMeter()
+
+        with torch.no_grad():
+            for x, y in val_loader:
+                x = x.to(device)
+                y = y.to(device)
+
+                x_in = torch.cat((y, x), dim=1)
+                output = model(x_in)
+                score = ssim_metric(output[0], x)
+                eval_meter.update(score.item(), x.numel())
+
+        writer.add_scalar("SSIM/val", eval_meter.avg, epoch)
+        print(f"Epoch {epoch}: Val SSIM {eval_meter.avg:.4f}")
+
+        if eval_meter.avg > best_score:
+            best_score = eval_meter.avg
+            save_checkpoint(
+                {
+                    "epoch": epoch,
+                    "state_dict": model.state_dict(),
+                    "best_score": best_score,
+                    "optimizer": optimizer.state_dict(),
+                },
+                save_dir=exp_dir,
+                filename=f"best_{best_score:.4f}.pth.tar"
+            )
+
+    writer.close()
+
+
+if __name__ == "__main__":
     main()
